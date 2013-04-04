@@ -57,12 +57,12 @@
                        v2 (second elem)
                        v3 (if (> (count elem) 2) (nth elem 2) nil)
                        val (case v
-                               fields (list 'fields* (vec (next elem)) fields-var#)
-                               offset (list 'offset* v2)
-                               limit (list 'limit* v2)
-                               order (list 'order* v2 v3)
-                               join (list 'join* (list 'quote v2) (list 'quote v3))
-                               where (list 'where* v2))]
+                             fields (list 'fields* (vec (next elem)) fields-var#)
+                             offset (list 'offset* v2)
+                             limit (list 'limit* v2)
+                             order (list 'order* v2 v3)
+                             join (list 'join* (list 'quote v2) (list 'quote v3))
+                             where (list 'where* v2))]
                    [(keyword v) val]))
 
         ;; Takes a list of definitions like '((where ...) (join ...) ...) and returns
@@ -207,36 +207,76 @@
 ;; TBD: Implement the following macros
 ;;
 
+(defn def-atoms []
+  (def ^:dynamic *group-vars*)
+  (def ^:dynamic *user-vars*)
+  (when-not (bound? #'*group-vars*)
+    (def ^:dynamic *group-vars* (atom {})))
+  (when-not (bound? #'*user-vars*)
+    (def ^:dynamic *user-vars* (atom {}))))
+
+(defn def-group-func [group table fields]
+  (let [func-name (symbol (clojure.string/lower-case (str "select-" group "-" table)))
+        table-fields-var (symbol (str  table "-fields-var"))
+        table-fields-val (vec (map keyword fields))
+        fields-sym (symbol 'fields)]
+    `(defn ~func-name []
+       (let [~table-fields-var ~table-fields-val]
+         (select ~table (~fields-sym :all))))))
+
+;; В атоме *group-vars* сохраняются права группы, например в таком виде:
+;; {:Agent {:agents (:clients_id :proposal_id :agent), :proposal (:person :phone :address :price)}}
+(defn def-group-var [group table fields]
+  ;; как проще заменить значение хешмапа?
+  (swap! *group-vars* #(update-in % [(keyword group) (keyword table)] (constantly (map keyword fields)))))
+
+(defn group* [group table fields]
+  (do
+    (def-group-var group table fields)
+    (def-group-func group table fields)))
+
 (defmacro group [name & body]
-  ;; Пример
-  ;; (group Agent
-  ;;      proposal -> [person, phone, address, price]
-  ;;      agents -> [clients_id, proposal_id, agent])
-  ;; 1) Создает группу Agent
-  ;; 2) Запоминает, какие таблицы (и какие колонки в таблицах)
-  ;;    разрешены в данной группе.
-  ;; 3) Создает следующие функции
-  ;;    (select-agent-proposal) ;; select person, phone, address, price from proposal;
-  ;;    (select-agent-agents)  ;; select clients_id, proposal_id, agent from agents;
-  )
+  (def-atoms)
+  (cons `do
+        (loop [b body res ()]
+          (if (empty? b)
+            res
+            (recur (drop 3 b) (conj res (group* name (first b) (nth b 2))))))))
+
+(defn get-user-permissions [username groups]
+  (let [
+        permissions (loop [grps groups res {}] ;; проходимся по списку групп и собираем права
+                      (if (empty? grps)
+                        res
+                        (recur (rest grps) (merge-with clojure.set/union res (get @*group-vars* (first grps))))))
+        filtered (loop [perms (keys permissions) res permissions]  ;; фильтруем повторяющиеся и заменяем на :all, если надо
+                   (if (empty? perms)
+                     res
+                     (recur (rest perms) (update-in res [(first perms)] #(if (some #{:all} %) '(:all) (distinct %))))))
+        ]
+    filtered))
+
+;; В атоме *user-vars* хранятся права пользователя, например так: {:Directorov {:agents :all, :proposal :all, :clients :all}, :Petrov {:proposal :all, :clients :all}, :Sidorov {:proposal (:person :phone :address :price), :agents (:clients_id :proposal_id :agent)}, :Ivanov {:proposal (:person :phone :address :price), :agents (:clients_id :proposal_id :agent)}}
+;; Хотя это неправильно, нужно было сделать, чтобы хранились привязки пользователя к группам. Тогда при изменении прав группы, права пользователя сохранят актуальность.
+(defn def-user-vars* [username groups] ;; username = Ivanov, groups = (Agent)
+  (let [usr (keyword username)
+        grps (map keyword groups)]
+    (swap! *user-vars* #(update-in % [usr] (constantly (get-user-permissions usr grps))))))
+
+(defn user-belongs-to* [username groups]
+  (def-user-vars* username groups))
 
 (defmacro user [name & body]
-  ;; Пример
-  ;; (user Ivanov
-  ;;     (belongs-to Agent))
-  ;; Создает переменные Ivanov-proposal-fields-var = [:person, :phone, :address, :price]
-  ;; и Ivanov-agents-fields-var = [:clients_id, :proposal_id, :agent]
-  ;; Сохраняет эти же переменные в атоме *user-tables-vars*.
-  )
+  (loop [b body]
+    (when-not (empty? b)
+      ((resolve (symbol (str "user-" (ffirst b) "*"))) name (rest (first b)))
+      (recur (rest b)))))
 
-(defmacro with-user [name & body]
-  ;; Пример
-  ;; (with-user Ivanov
-  ;;   . . .)
-  ;; 1) Находит все переменные, начинающиеся со слова Ivanov, в *user-tables-vars*
-  ;;    (Ivanov-proposal-fields-var и Ivanov-agents-fields-var)
-  ;; 2) Создает локальные привязки без префикса Ivanov-:
-  ;;    proposal-fields-var и agents-fields-var.
-  ;;    Таким образом, функция select, вызванная внутри with-user, получает
-  ;;    доступ ко всем необходимым переменным вида <table-name>-fields-var.
-  )
+(defmacro with-user [username & body]
+  (let [u (keyword username) ;; :Ivanov
+        tables (keys (get @*user-vars* u)) ;; (:proposal :agents)
+        bindings (vec (map #(symbol (subs (str % "-fields-var") 1)) tables)) ;; (proposal-fields-var agents-fields-var)
+        vals (vec (map #(vec (get-in @*user-vars* [u %])) tables)) ;; ([:phone :person :price :address] [:proposal_id :clients_id :agent])]
+        ]
+    `(let [~bindings ~vals]
+       ~@body)))
