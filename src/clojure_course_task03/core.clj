@@ -1,5 +1,6 @@
 (ns clojure-course-task03.core
-  (:require [clojure.set]))
+  (:require [clojure.set]
+            [clojure.string :as str]))
 
 (defn join* [table-name conds]
   (let [op (first conds)
@@ -7,6 +8,12 @@
         f2 (name (nth conds 2))]
     (str table-name " ON " f1 " " op " " f2)))
 
+;; вместо reduce + str лучше использовать clojure.string/join
+;; так что можно переписать на что-то вроде
+;; (str/join " and " 
+;;      (map (fn [[n v]] (str (name n) "=" (espace-value v))) 
+;;           data))
+;; еще одна вещь - строка должна быть escaped, иначе может быть SQL injection
 (defn where* [data]
   (let [ks (keys data)
         res (reduce str (doall (map #(let [src (get data %)
@@ -16,6 +23,7 @@
                                        (str (name %) " = " v ",")) ks)))]
     (reduce str (butlast res))))
 
+;; если у нас order будет nil то надо вернуть пустую строку в if
 (defn order* [column ord]
   (str (name column)
        (if-not (nil? ord) (str " " (name ord)))))
@@ -24,6 +32,7 @@
 
 (defn offset* [v] v)
 
+;; это можно заменить на (str/join "," (map name data))
 (defn -fields** [data]
   (reduce str (butlast (reduce str (doall (map #(str (name %) ",") data))))))
 
